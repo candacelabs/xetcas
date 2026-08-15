@@ -1,0 +1,135 @@
+// Bridge contracts: the minimal Git LFS surface that connects `git push` to
+// the Xet CAS transfer contract, plus the token bootstrap message.
+//
+// The client side is stock git-lfs plus git-xet (xet-core's LFS custom
+// transfer agent, registered as transfer "xet"). git-xet performs uploads
+// over the Xet protocol; downloads deliberately fall back to git-lfs basic
+// transfer, so the server reconstructs whole files and serves them by
+// sha256 oid.
+//
+// Wire mapping: Git LFS batch bodies are JSON with the exact field names
+// below (Content-Type application/vnd.git-lfs+json). Empty optional
+// sub-messages (actions, error, ref) are omitted from JSON, not emitted as
+// null — codegen marks them skip-if-empty. CasTokenInfo is the one message
+// in this package whose JSON is camelCase (casUrl, accessToken, exp),
+// matching xet-core's CasJWTInfo.
+//
+// Endpoints codified here:
+//
+//   POST {repo}.git/info/lfs/objects/batch   LfsBatchRequest -> LfsBatchResponse
+//   GET  <token route chosen by the server>  -> CasTokenInfo
+//     (handed to git-xet as the batch action href; also called by hf_xet
+//      style clients as token_refresh_url)
+//   GET  <download href chosen by the server> -> reconstructed file bytes
+//     (git-lfs basic transfer; body is the whole file whose sha256 is the
+//      requested oid)
+//
+// For an upload batch whose "transfers" includes "xet", the server answers
+// transfer "xet" and each object's upload action carries:
+//   href   = the token refresh route (git-xet GETs it when the token
+//            expires mid-session; response is CasTokenInfo)
+//   header = X-Xet-Cas-Url (CAS endpoint base, no trailing slash),
+//            X-Xet-Access-Token (opaque bearer token),
+//            X-Xet-Token-Expiration (decimal unix seconds, as a string),
+//            X-Xet-Session-Id (optional session correlation id)
+// Exact header casing is mandatory: git-xet does exact-case map lookups.
+// For download batches the server must NOT select "xet" (git-xet rejects
+// download init); it answers basic transfer with a download href.
+syntax = "proto3";
+
+package candace.xetcas.v1;
+
+import "liquidproto/v1/refinement.proto";
+
+option go_package = "github.com/candacelabs/xetcas/go/xetcasv1;xetcasv1";
+
+// LfsRef identifies the ref being pushed, when git-lfs supplies it.
+message LfsRef {
+  string name = 1;
+}
+
+// LfsObjectSpec names one object in a batch request.
+message LfsObjectSpec {
+  // git-lfs oid: SHA-256 of the file content, 64 lowercase hex chars
+  // (plain byte-order hex, unlike xet-core hash hex).
+  string oid = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+  uint64 size = 2;
+}
+
+// LfsBatchRequest is the subset of the Git LFS batch API request the server
+// consumes.
+message LfsBatchRequest {
+  // "upload" or "download".
+  string operation = 1 [(candace.liquid.v1.field) = {
+    expr: "this == \"upload\" || this == \"download\""
+  }];
+  // Transfer adapters the client supports, e.g. ["xet", "basic"]. Absent
+  // means ["basic"].
+  repeated string transfers = 2;
+  LfsRef ref = 3;
+  repeated LfsObjectSpec objects = 4;
+  // git-lfs sends "sha256"; anything else is rejected.
+  string hash_algo = 5 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 0 || this == \"sha256\""
+  }];
+}
+
+// LfsAction tells the client how to perform one operation on one object.
+message LfsAction {
+  string href = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) >= 1"
+  }];
+  // Headers the client must attach (for transfer "xet": the X-Xet-* set
+  // documented above, consumed verbatim by git-xet).
+  map<string, string> header = 2;
+  // Seconds of validity, advisory.
+  uint64 expires_in = 3;
+}
+
+// LfsObjectError reports a per-object failure inside a 200 batch response.
+message LfsObjectError {
+  // Git LFS convention: 404 object missing, 422 validation error.
+  uint32 code = 1;
+  string message = 2;
+}
+
+// LfsBatchObject is one object's entry in a batch response. An upload entry
+// with no actions means "server already has it, skip". Exactly one of
+// actions/error is populated when work or failure is being signaled.
+message LfsBatchObject {
+  string oid = 1;
+  uint64 size = 2;
+  // Whether href/header already embed authorization; suppresses git-lfs
+  // credential prompts on the action requests.
+  bool authenticated = 3;
+  // Keyed by action name: "upload", "download" (a "verify" action is
+  // deliberately never emitted by this server).
+  map<string, LfsAction> actions = 4;
+  LfsObjectError error = 5;
+}
+
+// LfsBatchResponse is the server's batch answer.
+message LfsBatchResponse {
+  // Chosen transfer adapter: "xet" for uploads negotiated with git-xet,
+  // "basic" otherwise (including every download batch).
+  string transfer = 1 [(candace.liquid.v1.field) = {
+    expr: "this == \"xet\" || this == \"basic\""
+  }];
+  repeated LfsBatchObject objects = 2;
+  string hash_algo = 3;
+}
+
+// CasTokenInfo is the token bootstrap/refresh response body. JSON is
+// camelCase: {"casUrl": ..., "exp": ..., "accessToken": ...} — exactly
+// xet-core's CasJWTInfo. exp is unix seconds.
+message CasTokenInfo {
+  string cas_url = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) >= 1"
+  }];
+  uint64 exp = 2;
+  string access_token = 3 [(candace.liquid.v1.field) = {
+    expr: "len(this) >= 1"
+  }];
+}

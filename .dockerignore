@@ -1,0 +1,6 @@
+# Build context hygiene for docker/Dockerfile.server and
+# docker/Dockerfile.workbench (context = the xetcas/ component root).
+.git
+target/
+xetcas-data/
+**/*.rs.bk

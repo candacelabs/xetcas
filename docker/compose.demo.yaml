@@ -1,0 +1,73 @@
+# The xetcas demo stack: one server, one workbench, one private network.
+#
+#   docker compose -f docker/compose.demo.yaml up -d --wait
+#
+# Nothing here depends on anything else in the monorepo; the project name is
+# pinned so the demo can never collide with another stack's containers,
+# volumes, or network.
+name: xetcas-demo
+
+services:
+  # The self-hosted Xet CAS server: git smart HTTP, the LFS batch bridge, and
+  # the Xet CAS v1 data plane, all out of one binary and one data directory.
+  xetcasd:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    image: xetcas/xetcasd:demo
+    environment:
+      XETCAS_DATA_DIR: /data
+      XETCAS_LISTEN: 0.0.0.0:8080
+      # Must be reachable *by the client*, because the server mints CAS and
+      # LFS URLs from it. Inside the demo network that is the service name.
+      XETCAS_PUBLIC_URL: http://xetcasd:8080
+      XETCAS_GIT_ROOT: /data/git
+      XETCAS_GIT_AUTOCREATE: "true"
+      # XETCAS_TOKEN is deliberately unset: the demo server is fully
+      # permissive. See the README's scope section.
+    volumes:
+      - xetcasd-data:/data
+    ports:
+      # Loopback-only: the demo publishes a port for poking at the API from
+      # the host, not for serving anything to the network.
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # The client: a plain developer box with git, git-lfs and git-xet. Every
+  # command in the demo runs in here, exactly as a human would run it.
+  workbench:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.workbench
+    image: xetcas/workbench:demo
+    depends_on:
+      xetcasd:
+        condition: service_healthy
+    environment:
+      XETCAS_DEMO_REPO_URL: http://xetcasd:8080/git/models/demo.git
+      XETCAS_DEMO_WORK: /home/xet/work
+      GIT_TERMINAL_PROMPT: "0"
+    volumes:
+      # The demo scripts, read-only: the container never mutates the repo.
+      - ../demo:/demo:ro
+      # HOME on a volume so `git config --global`, the git-xet registration and
+      # the xet caches survive across `docker compose exec` invocations.
+      - workbench-home:/home/xet
+    working_dir: /home/xet/work
+    tty: true
+    stdin_open: true
+    command: ["sleep", "infinity"]
+
+volumes:
+  xetcasd-data:
+  workbench-home:
+
+networks:
+  default:
+    name: xetcas-demo

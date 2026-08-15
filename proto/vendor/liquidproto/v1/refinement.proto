@@ -1,0 +1,44 @@
+// VENDORED — DO NOT EDIT BY HAND.
+//
+// Canonical source: candacelib `liquidproto/v1/refinement.proto`
+//   upstream repo: github.com/candacelabs/candacelib
+//   monorepo path: go/candacelib/liquidproto/v1/refinement.proto
+//   pin:           export-4bbae8aa45d6 (published from candace-server main
+//                  4bbae8aa), the same tag Dockerfile.codegen installs as
+//                  CANDACELIB_VERSION.
+//
+// This copy exists so the Rust codegen path (protox, pure Rust, no protoc and
+// no Go module cache) can resolve the custom option import offline. The Go
+// codegen path keeps using /opt/candacelib inside the pinned image, and
+// `proto/generate-in-container.sh check` diffs this file against that image
+// copy so drift fails CI.
+//
+// Everything below the marker line is byte-for-byte upstream.
+//
+// ---8<--- upstream verbatim below this line ---8<---
+// Refinement annotations shared by Liquid Proto contracts.
+//
+// protoc-gen-liquidproto compiles these predicates into native Go checks and
+// emits direct message validation boundaries.
+syntax = "proto3";
+
+package candace.liquid.v1;
+
+import "google/protobuf/descriptor.proto";
+
+option go_package = "github.com/candacelabs/candacelib/liquidproto/v1;liquidv1";
+
+// FieldRefinement attaches a predicate to a singular protobuf scalar.
+message FieldRefinement {
+  // Boolean expression over `this`, using comparisons, &&, ||, !, len(), and
+  // matches().
+  string expr = 1;
+
+}
+
+extend google.protobuf.FieldOptions {
+  // 51234 is retained from the research implementation. Changing it would
+  // silently reinterpret existing descriptors, so it is part of the wire
+  // contract.
+  FieldRefinement field = 51234;
+}

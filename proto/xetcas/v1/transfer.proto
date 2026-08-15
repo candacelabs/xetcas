@@ -1,0 +1,207 @@
+// Transfer contracts for the Xet CAS storage/transfer protocol.
+//
+// These messages codify the HTTP surface a Xet CAS server must expose for the
+// real xet-core client (github.com/huggingface/xet-core, rev 77fc84d3d), as
+// specified by that repository's openapi/cas.openapi.yaml and confirmed
+// against the client source. Storage and transfer only: authentication is a
+// deployment concern outside this contract (the server accepts a bearer token
+// but this schema does not model token issuance), and the fire-and-forget
+// /v1/telemetry endpoint is deliberately not modeled — a server returns
+// 200 and drops the body.
+//
+// Wire mapping. The transfer wire format is JSON; field names below match the
+// wire byte-for-byte. Messages that appear as JSON map values wrapped in a
+// single repeated field (FetchInfoList, XorbFetchList) MUST serialize as the
+// bare array, not as an object — Rust codegen marks them #[serde(transparent)]
+// and the Go boundary marshals the inner slice directly.
+//
+// Endpoints covered (all under the client-configured endpoint base URL):
+//
+//   GET  /v1/reconstructions/{file_id}   -> QueryReconstructionResponse
+//   GET  /v2/reconstructions/{file_id}   -> QueryReconstructionResponseV2
+//                                           (optional; 404/501 => client
+//                                           falls back to v1 and caches that)
+//   GET  /v1/chunks/{prefix}/{hash}      -> raw shard bytes (global dedup)
+//   POST /v1/xorbs/{prefix}/{hash}       -> UploadXorbResponse
+//   POST /v1/shards                      -> UploadShardResponse
+//
+// Xorb and shard request bodies are the xet-core binary serialization formats
+// (application/octet-stream); their internal layout is xet-core's contract,
+// not re-specified here. The storage.proto sibling schema codifies what a
+// server persists after parsing them; bridge.proto codifies the Git LFS
+// bridge that makes `git push` reach this surface.
+//
+// Semantics a conforming server must honor (research citations live in
+// docs/research/):
+//   - A ranged reconstruction whose start is at/past EOF answers 416, not
+//     404 — the client uses 416 as its end-of-file discovery signal.
+//   - Xorb and shard uploads are idempotent; re-uploads happen on retry and
+//     resume. Any 200 is success.
+//   - Xorb upload bodies arrive as chunked transfer WITH an explicit
+//     Content-Length; accept both simultaneously.
+//   - Dedup misses are 404. The client coerces every dedup error to a miss
+//     and never retries; global dedup is best-effort by design.
+//   - fetch_info URLs are fetched with NO Authorization header. Expired
+//     URLs must answer 403 (the one status that triggers refresh+retry).
+//   - The batch form GET /v1/reconstructions?file_id=... has no production
+//     caller in xet-core and is deliberately not part of this contract.
+//   - Authorization: Bearer and X-Xet-Session-Id request headers must be
+//     accepted; a permissive deployment may ignore both.
+syntax = "proto3";
+
+package candace.xetcas.v1;
+
+import "liquidproto/v1/refinement.proto";
+
+option go_package = "github.com/candacelabs/xetcas/go/xetcasv1;xetcasv1";
+
+// IndexRange is a chunk-index range within a xorb, end-EXCLUSIVE: [start, end).
+// Cross-field invariant (start < end for non-empty ranges) is enforced by the
+// boundary validators; per-field refinements cannot express it.
+message IndexRange {
+  uint32 start = 1;
+  uint32 end = 2;
+}
+
+// ByteRange is a byte range, end-INCLUSIVE: [start, end], matching HTTP Range
+// header semantics ("bytes={start}-{end}").
+message ByteRange {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+// QueryReconstructionRequest is the parsed form of
+// GET /v1/reconstructions/{file_id} (and /v2/...).
+message QueryReconstructionRequest {
+  // File hash in hex: exactly 64 lowercase hexadecimal characters.
+  string file_id = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+  // Optional byte range from the HTTP Range header (bytes={start}-{end},
+  // end-inclusive). Absent means the whole file.
+  optional ByteRange range = 2;
+}
+
+// CasReconstructionTerm is one ordered term of a file reconstruction: take
+// chunks [range.start, range.end) from the xorb named by hash.
+message CasReconstructionTerm {
+  // Xorb hash in hex: exactly 64 lowercase hexadecimal characters.
+  string hash = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+  // Chunk-index range within the xorb, end-exclusive.
+  IndexRange range = 2;
+  // Total unpacked (decompressed) byte length of the term's chunks. u32 on
+  // the wire (xet_client cas_types); a term never exceeds one xorb's 64 MiB.
+  uint32 unpacked_length = 3;
+}
+
+// CasReconstructionFetchInfo tells the client how to fetch one chunk range of
+// one xorb: issue GET {url} with "Range: bytes={url_range.start}-{url_range.end}"
+// (end-inclusive) and treat the body as the serialized chunk frames covering
+// chunk range [range.start, range.end). The URL may be any HTTP(S) URL,
+// including one served by the same CAS server; it must remain valid for the
+// duration of a client download session.
+message CasReconstructionFetchInfo {
+  IndexRange range = 1;
+  string url = 2 [(candace.liquid.v1.field) = {
+    expr: "len(this) >= 1"
+  }];
+  ByteRange url_range = 3;
+}
+
+// FetchInfoList is the JSON-transparent list wrapper for fetch_info map
+// values: it serializes as the bare array of entries.
+message FetchInfoList {
+  repeated CasReconstructionFetchInfo entries = 1;
+}
+
+// QueryReconstructionResponse is the v1 reconstruction body.
+message QueryReconstructionResponse {
+  // Bytes to discard from the start of the first term before returning data
+  // to the caller (nonzero only for ranged queries whose start falls inside
+  // a chunk).
+  uint64 offset_into_first_range = 1;
+  repeated CasReconstructionTerm terms = 2;
+  // Map from xorb hash (64-char lowercase hex) to fetch entries for every
+  // chunk range referenced by terms. Values serialize as bare JSON arrays.
+  map<string, FetchInfoList> fetch_info = 3;
+}
+
+// XorbRangeDescriptor pairs a chunk range with the byte range it occupies in
+// the stored (serialized) xorb.
+message XorbRangeDescriptor {
+  IndexRange chunks = 1;
+  ByteRange bytes = 2;
+}
+
+// XorbMultiRangeFetch is one signed multi-range fetch entry of the v2
+// reconstruction response. The client sends exactly the byte ranges listed,
+// as one multi-range HTTP Range header, against url.
+message XorbMultiRangeFetch {
+  string url = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) >= 1"
+  }];
+  // Ranges covered by this URL, sorted ascending by chunks.start.
+  repeated XorbRangeDescriptor ranges = 2;
+}
+
+// XorbFetchList is the JSON-transparent list wrapper for the v2 xorbs map
+// values: it serializes as the bare array of entries.
+message XorbFetchList {
+  repeated XorbMultiRangeFetch entries = 1;
+}
+
+// QueryReconstructionResponseV2 is the v2 (multi-range optimized) body.
+// Servers may omit v2 entirely; clients fall back to v1 on 404/501.
+message QueryReconstructionResponseV2 {
+  uint64 offset_into_first_range = 1;
+  repeated CasReconstructionTerm terms = 2;
+  // Map from xorb hash to multi-range fetch entries (bare JSON arrays).
+  map<string, XorbFetchList> xorbs = 3;
+}
+
+// ChunkDedupQuery is the parsed form of GET /v1/chunks/{prefix}/{hash}: the
+// global-deduplication probe. A hit returns raw shard bytes
+// (application/octet-stream) whose cas-info section names the xorb containing
+// the chunk; a miss is 404.
+message ChunkDedupQuery {
+  // Prefix path segment. The OpenAPI spec documents "default-merkledb" here,
+  // but the real client sends its configured default prefix ("default") for
+  // both this route and xorb upload — servers accept any non-empty prefix.
+  string prefix = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) >= 1"
+  }];
+  string hash = 2 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+}
+
+// UploadXorbKey is the parsed form of POST /v1/xorbs/{prefix}/{hash} path
+// parameters. The request body is the xet-core serialized xorb; the server
+// must verify the body's computed xorb hash equals hash before storing.
+message UploadXorbKey {
+  // Prefix path segment; the client sends "default". Accept any non-empty
+  // prefix (see ChunkDedupQuery.prefix).
+  string prefix = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) >= 1"
+  }];
+  string hash = 2 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+}
+
+// UploadXorbResponse is the JSON body answering a xorb upload.
+message UploadXorbResponse {
+  // false when the xorb already existed; the upload is idempotent either way.
+  bool was_inserted = 1;
+}
+
+// UploadShardResponse is the JSON body answering POST /v1/shards.
+// result follows xet-core's numeric convention: 0 = shard already exists,
+// 1 = sync performed (registered). Clients treat any 200 as success.
+message UploadShardResponse {
+  uint32 result = 1 [(candace.liquid.v1.field) = {
+    expr: "this <= 1"
+  }];
+}

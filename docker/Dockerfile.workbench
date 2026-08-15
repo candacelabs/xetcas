@@ -1,0 +1,105 @@
+# syntax=docker/dockerfile:1.7
+#
+# xetcas workbench — the *client* side of the demo.
+#
+# Contains everything a developer needs to push large files into a xetcasd
+# server: git, a pinned git-lfs, and git-xet (xet-core's LFS custom transfer
+# agent) built from the exact upstream revision this component targets.
+#
+# Build context: the xetcas/ directory (nothing from the context is copied in;
+# the context is kept consistent with the other images so one compose file can
+# build both).
+#
+#   docker build -f docker/Dockerfile.workbench -t xetcas-workbench .
+
+ARG RUST_VERSION=1.91
+ARG DEBIAN_RELEASE=bookworm
+
+# ---------------------------------------------------------------------------
+# Stage 1: build git-xet from the pinned xet-core revision.
+# ---------------------------------------------------------------------------
+FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS git-xet-builder
+
+# Pinned xet-core revision. This is the protocol reference for the whole
+# component: xetcasd is written against the CAS API this revision speaks.
+ARG XET_CORE_REPO=https://github.com/huggingface/xet-core
+ARG XET_CORE_REV=77fc84d3d077973dade91a216da5e6b4a1595ca0
+
+# git2 links against the system OpenSSL; cmake is needed by a few transitive
+# -sys crates.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cmake \
+        libssl-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# --locked builds exactly the dependency set recorded in xet-core's Cargo.lock
+# at ${XET_CORE_REV}, so the agent binary is reproducible from the pin alone.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo install \
+        --locked \
+        --root /out \
+        --git "${XET_CORE_REPO}" \
+        --rev "${XET_CORE_REV}" \
+        git_xet \
+    && /out/bin/git-xet --version
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime workbench.
+# ---------------------------------------------------------------------------
+FROM debian:${DEBIAN_RELEASE}-slim AS runtime
+
+ARG GIT_LFS_VERSION=3.7.1
+ARG GIT_LFS_SHA256_AMD64=1c0b6ee5200ca708c5cebebb18fdeb0e1c98f1af5c1a9cba205a4c0ab5a5ec08
+ARG GIT_LFS_SHA256_ARM64=73a9c90eeb4312133a63c3eaee0c38c019ea7bfa0953d174809d25b18588dd8d
+ARG TARGETARCH=amd64
+
+# python3 generates the deterministic synthetic model file in the demo;
+# libssl3 is git-xet's only non-trivial shared library.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        less \
+        libssl3 \
+        procps \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Debian ships an older git-lfs; pin the version the demo is validated against.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) lfs_sha="${GIT_LFS_SHA256_AMD64}" ;; \
+        arm64) lfs_sha="${GIT_LFS_SHA256_ARM64}" ;; \
+        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    tarball="git-lfs-linux-${TARGETARCH}-v${GIT_LFS_VERSION}.tar.gz"; \
+    curl -fsSL -o /tmp/git-lfs.tar.gz \
+        "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/${tarball}"; \
+    echo "${lfs_sha}  /tmp/git-lfs.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/git-lfs.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/git-lfs-${GIT_LFS_VERSION}/git-lfs" /usr/local/bin/git-lfs; \
+    rm -rf /tmp/git-lfs.tar.gz "/tmp/git-lfs-${GIT_LFS_VERSION}"; \
+    git-lfs version
+
+COPY --from=git-xet-builder /out/bin/git-xet /usr/local/bin/git-xet
+
+# Non-root by default. /home/xet is a mount point for a named volume in the
+# demo compose file so `git config --global` and the xet cache survive across
+# `docker compose exec` invocations.
+RUN useradd --create-home --home-dir /home/xet --shell /bin/bash --uid 1000 xet \
+    && mkdir -p /home/xet/work \
+    && chown -R xet:xet /home/xet
+
+USER xet
+WORKDIR /home/xet/work
+ENV HOME=/home/xet \
+    USER=xet \
+    GIT_PAGER=cat \
+    PAGER=cat
+
+# Long-lived so `docker compose exec workbench ...` can drive the demo.
+CMD ["sleep", "infinity"]

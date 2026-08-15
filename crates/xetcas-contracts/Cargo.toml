@@ -1,0 +1,24 @@
+[package]
+name = "xetcas-contracts"
+version = "0.1.0"
+description = "Wire-exact Rust types and boundary validators for the Xet CAS v1 contracts."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "xetcas_contracts"
+path = "src/lib.rs"
+
+[dependencies]
+prost = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# Parity tests deserialize our JSON into the real client's types and back.
+# Pinned exactly: the contract is "what xet-core 1.6.0 accepts", not "what the
+# latest release happens to accept".
+xet-client = "=1.6.0"

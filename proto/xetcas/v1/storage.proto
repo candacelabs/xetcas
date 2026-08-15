@@ -1,0 +1,103 @@
+// Storage contracts for the Xet CAS server: the metadata a server persists
+// after parsing the binary artifacts the client uploads.
+//
+// The blobs themselves are stored verbatim-plus-footer: an uploaded xorb
+// arrives as bare chunk frames (no footer); the server verifies it, appends
+// the canonical xet-core V1 footer, and stores the result. Chunk frames stay
+// at their original offsets from byte 0, so every url_range handed out by
+// the transfer contract indexes the stored object directly.
+//
+// These records are encoded with prost's deterministic encoding and stored
+// as single-row blobs in the server's index database, keyed by their hash.
+// They deliberately contain no maps (map ordering would break deterministic
+// encoding) and no floating point. Schema evolution follows proto rules:
+// never reuse or renumber fields.
+//
+// The chunk-level global-deduplication index is NOT a proto blob: it is a
+// relational table (chunk_hash -> xorb_hash, chunk_index) because it is
+// queried by key, not read whole. Only dedup-eligible chunk hashes are
+// indexed: a chunk is eligible when hash % 1024 == 0 (the modulus applies to
+// the fourth u64 of the hash, little-endian — xet-core's convention) or when
+// it starts a file, or when its shard entry carries the global-dedup flag
+// (bit 31).
+syntax = "proto3";
+
+package candace.xetcas.v1;
+
+import "liquidproto/v1/refinement.proto";
+
+option go_package = "github.com/candacelabs/xetcas/go/xetcasv1;xetcasv1";
+
+// XorbRecord is the per-xorb index entry, derived by parsing and verifying
+// an uploaded xorb body. Offsets use xet-core's conventions: entry k is the
+// cumulative end offset of chunk k, so chunk k spans
+// [k == 0 ? 0 : offsets[k-1], offsets[k]).
+message XorbRecord {
+  // Xorb hash in xet-core hex form (64 lowercase hex chars; per-u64
+  // little-endian groups, not plain byte-order hex).
+  string xorb_hash = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+  // Number of chunk frames. A xorb holds at most 8192 chunks.
+  uint32 num_chunks = 2 [(candace.liquid.v1.field) = {
+    expr: "this >= 1 && this <= 8192"
+  }];
+  // Byte length of the chunk-frame region of the stored object (the region
+  // fetch URLs index into). The at-rest footer begins at this offset.
+  uint64 frames_length = 3;
+  // Total uncompressed content length; a xorb holds at most 64 MiB.
+  uint64 unpacked_length = 4 [(candace.liquid.v1.field) = {
+    expr: "this <= 67108864"
+  }];
+  // Cumulative physical end offset of each chunk frame (header included),
+  // one entry per chunk; the last equals frames_length.
+  repeated uint32 chunk_boundary_offsets = 5;
+  // Cumulative uncompressed end offset of each chunk, one entry per chunk;
+  // the last equals unpacked_length.
+  repeated uint32 unpacked_chunk_offsets = 6;
+  // Raw 32-byte chunk hashes concatenated in chunk order (32 * num_chunks
+  // bytes, xet-core memory order). Needed to build keyed dedup shards and to
+  // verify shard verification entries.
+  bytes chunk_hashes = 7;
+  // Unix seconds when the xorb was first stored.
+  uint64 created_at = 8;
+}
+
+// FileTermRecord is one ordered reconstruction term of a stored file,
+// mirroring a shard FileDataSequenceEntry.
+message FileTermRecord {
+  string xorb_hash = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+  // Chunk-index range within the xorb, end-exclusive.
+  uint32 chunk_index_start = 2;
+  uint32 chunk_index_end = 3;
+  // Uncompressed byte length this term contributes to the file.
+  uint32 unpacked_segment_bytes = 4;
+}
+
+// FileRecord is the per-file index entry, derived from an uploaded shard's
+// file-info section.
+message FileRecord {
+  // Xet file hash in xet-core hex form.
+  string file_hash = 1 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\")"
+  }];
+  // Total file length = sum of term unpacked_segment_bytes.
+  uint64 file_length = 2;
+  // SHA-256 of the file content in plain hex, from the shard's
+  // FileMetadataExt when present, else empty. This is the linkage that lets
+  // the LFS bridge serve downloads by git-lfs oid.
+  string sha256 = 3 [(candace.liquid.v1.field) = {
+    expr: "len(this) == 0 || (len(this) == 64 && matches(this, \"^[0-9a-f]{64}$\"))"
+  }];
+  // Ordered reconstruction terms.
+  repeated FileTermRecord terms = 4;
+  // Raw 32-byte verification range hashes concatenated in term order
+  // (32 * len(terms) bytes) when the shard carried verification entries,
+  // else empty. range_hash = blake3_keyed(VERIFICATION_KEY,
+  // concat(chunk hashes of the term's range)).
+  bytes verification_range_hashes = 5;
+  // Unix seconds when the file record was first registered.
+  uint64 created_at = 6;
+}

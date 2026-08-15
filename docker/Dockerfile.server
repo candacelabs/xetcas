@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1.7
+#
+# xetcasd — the self-hosted Xet CAS server.
+#
+# Build context: the xetcas/ directory (the Cargo workspace root).
+#
+#   docker build -f docker/Dockerfile.server -t xetcasd .
+#
+# The runtime image ships `git` because xetcasd serves git smart HTTP by
+# execing `git http-backend`, and `curl` so the container can health-check
+# itself without a shell HTTP client of its own.
+
+ARG RUST_VERSION=1.91
+ARG DEBIAN_RELEASE=bookworm
+
+# ---------------------------------------------------------------------------
+# Stage 1: build the release binary.
+# ---------------------------------------------------------------------------
+FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# The target dir is a cache mount, so the binary is installed to /out inside
+# the same layer — nothing under /src/target survives the RUN.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --release -p xetcasd \
+    && install -Dm755 target/release/xetcasd /out/xetcasd
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime.
+# ---------------------------------------------------------------------------
+FROM debian:${DEBIAN_RELEASE}-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out/xetcasd /usr/local/bin/xetcasd
+
+# Non-root. /data is chowned *before* the VOLUME declaration so a fresh named
+# volume inherits the right ownership from the image.
+RUN useradd --system --create-home --home-dir /var/lib/xetcasd --shell /usr/sbin/nologin --uid 10001 xetcasd \
+    && mkdir -p /data \
+    && chown xetcasd:xetcasd /data
+
+VOLUME /data
+
+ENV XETCAS_DATA_DIR=/data \
+    XETCAS_LISTEN=0.0.0.0:8080
+
+USER xetcasd
+WORKDIR /data
+EXPOSE 8080
+
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+
+ENTRYPOINT ["xetcasd"]

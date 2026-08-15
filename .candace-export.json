@@ -1,0 +1,9 @@
+{
+  "destination_repository": "candacelabs/xetcas",
+  "managed_by": "candace-component-export",
+  "schema_version": 2,
+  "source_path": "xetcas",
+  "source_repository": "kaashmonee/candace-server",
+  "source_revision": "1ada5700370a38c24d2b1f9d53687db24382791c",
+  "source_tree_oid": "ed413ef51d954ac17e90988e0150e8779f9c1d45"
+}

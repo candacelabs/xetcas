@@ -1,0 +1,112 @@
+# CI for the generated standalone repository (candacelabs/xetcas), where the
+# repository root is the contents of the monorepo's xetcas/ directory.
+#
+# Three jobs, no publishing:
+#   rust           format, lint, tests, and Rust codegen drift
+#   go-contracts   Go codegen drift and the generated types' tests, containerized
+#   workbench      the client image still builds from the pinned xet-core rev
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.91
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-features
+
+      # protox-based codegen: pure Rust, no protoc on the runner.
+      - name: rust codegen drift
+        run: cargo xtask gen-proto --check
+
+  go-contracts:
+    name: go-contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Read by proto/generate.sh, reused by the test step below.
+      XETCAS_PROTO_TOOLCHAIN_IMAGE: xetcas/proto-codegen:go1.26.5-protoc35.1
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds the pinned protoc/protoc-gen-go/protoc-gen-liquidproto image and
+      # fails if regenerating the Go contracts changes a committed file, or if
+      # the committed file set differs from the generated one.
+      - name: go codegen drift
+        run: bash proto/generate.sh check
+
+      # A drift check that cannot fail is worse than none. This plants an
+      # obsolete committed *.pb.go, requires check mode to reject it, and
+      # removes it again.
+      - name: go codegen drift check is not vacuous
+        run: bash proto/generate.sh check-drift
+
+      # Reuse that image (Go 1.26.5, GOTOOLCHAIN=local) rather than installing a
+      # toolchain on the runner. The mount is read-only: `go test` writes only to
+      # its caches inside the container.
+      - name: go test
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            --volume "${PWD}:/workspace:ro" \
+            --workdir /workspace/go \
+            "${XETCAS_PROTO_TOOLCHAIN_IMAGE}" \
+            go test ./...
+
+  workbench:
+    name: workbench-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Compiles git-xet from the pinned xet-core revision. Build only, no push:
+      # if this breaks, the demo's client half is broken.
+      - name: build workbench image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.workbench
+          push: false
+          load: true
+          tags: xetcas-workbench:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: verify the toolchain in the image
+        run: |
+          docker run --rm xetcas-workbench:ci git-xet --version
+          docker run --rm xetcas-workbench:ci git lfs version
